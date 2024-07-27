@@ -2,7 +2,7 @@
 NVCC = nvcc
 
 # Architecture
-ARCH = -arch=sm_89
+ARCH = -arch=sm_90
 
 # Flags for NVCC to link cublas
 CUBLAS_FLAGS = -lcublas
