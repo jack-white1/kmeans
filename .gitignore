@@ -1,0 +1,4 @@
+cublas_check
+curand_test
+multi_kernel_k_means
+single_kernel_k_means

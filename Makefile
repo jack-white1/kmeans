@@ -2,10 +2,10 @@
 NVCC = nvcc
 
 # Architecture
-ARCH = -arch=sm_90
+ARCH = -arch=sm_89
 
 # Flags for NVCC to link cublas
-CUBLAS_FLAGS = -lcublas
+CUBLAS_FLAGS = -lcublas -lcurand
 
 # Source files
 SRCS = single_kernel_k_means.cu multi_kernel_k_means.cu cublas_check.cu
