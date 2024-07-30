@@ -29,8 +29,6 @@ __global__ void assign_labels(float* centroids, float* particles, int32_t* outpu
     __shared__ half        centroidsTile[K*N];
     __shared__ half        particlesTile[K*N];
     __shared__ half           outputTile[K*N];
-
-    __shared__ half        centroidsSquaredTileHalf[K*N];
 	__shared__ half				 sumSquaredTileHalf[K*N];
 
     long int rowsPerBlock = M / NBLOCKS;
@@ -40,21 +38,17 @@ __global__ void assign_labels(float* centroids, float* particles, int32_t* outpu
         centroidsTile[localIndex] = __float2half(centroids[localIndex]);
     }
 
+    half myCentroidSquaredVal = __float2half(0.0f);
+    half newCentroidValue;
+
     if (threadIdx.x < 16){
-        half mySquaredVal = __float2half(0.0f);
-        half newValue;
-		
         for (long int step = 0; step < 16; step++){
-            newValue = centroidsTile[threadIdx.x * 16 + step];
-            mySquaredVal += newValue * newValue;
+            newCentroidValue = centroidsTile[threadIdx.x * 16 + step];
+            myCentroidSquaredVal += newCentroidValue * newCentroidValue;
         }
 
-		
-        for (long int step = 0; step < 16; step++){
-			centroidsSquaredTileHalf[threadIdx.x * 16 + step]=mySquaredVal;
-		} 
     }
-    
+
     for (long int tileIndex = 0; tileIndex < M / NBLOCKS / K; tileIndex++){
         long int particlesOffset = blockIdx.x * rowsPerBlock * 16 + tileIndex*16*16;
 
@@ -73,19 +67,19 @@ __global__ void assign_labels(float* centroids, float* particles, int32_t* outpu
 		particlesTile[threadIdx.x * 4 + 130] = __float2half(temp2.z);
 		particlesTile[threadIdx.x * 4 + 131] = __float2half(temp2.w);
 
-        if (threadIdx.x < 16){
-            half mySquaredVal = __float2half(0.0f);
-            half newValue;
-			
-            for (long int step = 0; step < 16; step++){
-                newValue = particlesTile[threadIdx.x * 16 + step];
-                mySquaredVal += newValue * newValue;
-            }
-			
-            for (long int step = 0; step < 16; step++){
-				sumSquaredTileHalf[step * 16 + threadIdx.x] = __float2half(-0.5) * (mySquaredVal + centroidsSquaredTileHalf[step * 16 + threadIdx.x]);
-			}
-        }
+        
+		half mySquaredVal = __float2half(0.0f);
+		half newValue, outValue;
+		
+		for (long int step = 0; step < 16; step++){
+			newValue = particlesTile[threadIdx.x * 16 + step];
+			mySquaredVal += newValue * newValue;
+		}
+
+		for (long int step = 0; step < 16; step++){
+			outValue = __float2half(-0.5) * (mySquaredVal + __shfl_sync(0xffffffff, myCentroidSquaredVal, step));
+			if (threadIdx.x < 16) sumSquaredTileHalf[step * 16 + threadIdx.x] = outValue;
+		}
 
         wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
         wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag;

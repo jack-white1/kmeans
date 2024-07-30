@@ -1,7 +1,3 @@
-cublas_check
-curand_test
-multi_kernel_k_means
-single_kernel_k_means
 .vscode/*
-multi_kernel_k_means.cu
 backups/*
+kmeans
