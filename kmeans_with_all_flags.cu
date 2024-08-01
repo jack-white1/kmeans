@@ -50,32 +50,30 @@ __global__ void assign_labels_very_slowly(float *centroids, float *particles, in
             }
         }
         output[idx] = closestCentroidIdx;
+		//if (idx < 32){
+		//	printf("OLD METHOD Particle %d assigned to centroid %d\n", idx, closestCentroidIdx);
+		//}
     }
 }
 
-__global__ void assign_labels(float* centroids, float* particles, float* newCentroids, int32_t* output, int32_t dim, int32_t nParticles, int32_t nCentroids) {
+__global__ void assign_labels(float* centroids, float* particles, int32_t* output, int32_t dim, int32_t nParticles, int32_t nCentroids) {
 #ifdef TIMING
 	unsigned long int startKernel, stopKernel, totalKernel;
 	unsigned long int startLoad, stopLoad, totalLoad;
 	unsigned long int startSumSquared, stopSumSquared, totalSumSquared;
-	unsigned long int startSumSquared2, stopSumSquared2, totalSumSquared2;
 	unsigned long int startMMA, stopMMA, totalMMA;
 	unsigned long int startStore, stopStore, totalStore;
 	startKernel = clock64();
 	totalKernel = 0;
 	totalLoad = 0;
 	totalSumSquared = 0;
-	totalSumSquared2 = 0;
 	totalMMA = 0;
 	totalStore = 0;
 #endif
 	__shared__ half        centroidsTile[K][N];
     __shared__ half        particlesTile[K][N];
+	__shared__ float	   nextParticlesTile[K][N];
     __shared__ half           outputTile[K][N];
-	__shared__ half 	   mmaOutputTile[K][N];
-	__shared__ half 	newCentroidsTile[K][N];
-
-	__shared__ float   nextParticlesTile[K][N];
 
     long int rowsPerBlock = M / NBLOCKS;
 	long int tilesPerBlock = M / NBLOCKS / K;
@@ -91,16 +89,11 @@ __global__ void assign_labels(float* centroids, float* particles, float* newCent
 	}
 #endif
 
-	// transpose the centroids tile on the load
+	// transpose the tile on the load
 	if (warpIndex == 0){
 		for (int i = 0; i < K; i++){
 			centroidsTile[threadIdx.x][i] = __float2half(centroids[i * N + threadIdx.x]);
 		}
-	}
-
-	// set newCentroids to zero
-	for (int i = 0; i < K; i++){
-		newCentroidsTile[i][threadIdx.x] = __float2half(0.0f);
 	}
 
 
@@ -226,7 +219,7 @@ __global__ void assign_labels(float* centroids, float* particles, float* newCent
 #endif
 
 
-		half mySquaredVal = __float2half(0.0f);
+		/*half mySquaredVal = __float2half(0.0f);
 		half newValue, outValue;
 		
 		if (warpIndex == 0){
@@ -244,20 +237,11 @@ __global__ void assign_labels(float* centroids, float* particles, float* newCent
 
 			for (long int step = 0; step < K; step++){
 				outValue = __float2half(-0.5) * (mySquaredVal + __shfl_sync(0xffffffff, myCentroidSquaredVal, step));
-				outputTile[threadIdx.x][step] = outValue;
+				//outputTile[threadIdx.x][step] = outValue;
 			}
-		}
-
-#ifdef TIMING
-		stopSumSquared = clock64();
-		totalSumSquared += stopSumSquared - startSumSquared;
-		startSumSquared2 = clock64();
-#endif
-
-		/*
+		}*/
 		__syncthreads();
 		// non warpzero version
-		#pragma unroll
 		for (int step = 0; step < 8; step++){
 			int myRow = (threadIdx.x / 32) + 4 * step;
 			int myCol = threadIdx.x % 32;
@@ -268,45 +252,52 @@ __global__ void assign_labels(float* centroids, float* particles, float* newCent
 				myValSquared += __shfl_down_sync(0xffffffff, myValSquared, i);
 			}
 			myValSquared = __shfl_sync(0xffffffff, myValSquared, 0);
+#ifdef DEBUG
+			if (blockIdx.x == targetBlockIdx && tileIndex == targetTileIndex && step == 0){
+				printf("threadIdx.x: %d, step: %d, myRow: %d, myCol: %d, myVal: %f, myValSquared: %f, myCentroidSquaredValue = %f\n", threadIdx.x, step, myRow, myCol, __half2float(myVal), __half2float(myValSquared), __half2float(myCentroidSquaredVal));
+			}
+#endif
 			// calculate the output value
 			half outVal = __float2half(-0.5) * (myValSquared + myCentroidSquaredVal);
 			outputTile[myRow][myCol] = outVal;
 		}
 		__syncthreads();
-		*/
 
-
-#ifdef TIMING
-		stopSumSquared2 = clock64();
-		totalSumSquared2 += stopSumSquared2 - startSumSquared2;
-		startMMA = clock64();
-#endif
 #ifdef DEBUG
-
 		if (threadIdx.x == targetThreadIdx && blockIdx.x == targetBlockIdx && tileIndex == targetTileIndex){
-			printf("\nCentroids Tile 32x32: (on wmma entry)\n");
+			printf("TargetthreadIndex: %d, TargetBlockIndex: %d, TargetTileIndex: %d\n", targetThreadIdx, targetBlockIdx, targetTileIndex);
+			printf("Centroids Tile 32x32 (should be transposed vs GMEM version):\n");
 			for (int i = 0; i < 32; i++){
 				for (int j = 0; j < 32; j++){
 					printf("%f ", __half2float(centroidsTile[i][j]));
 				}
 				printf("\n");
 			}
-			printf("\nParticles Tile 32x32: (on wmma entry)\n");
+			printf("\n");
+			printf("TargetthreadIndex: %d, TargetBlockIndex: %d, TargetTileIndex: %d\n", targetThreadIdx, targetBlockIdx, targetTileIndex);
+			printf("Particles Tile 32x32:\n");
 			for (int i = 0; i < 32; i++){
 				for (int j = 0; j < 32; j++){
 					printf("%f ", __half2float(particlesTile[i][j]));
 				}
 				printf("\n");
 			}
-			printf("\nOutput Tile 32x32: (on wmma entry)\n");
+			printf("\n");
+			printf("TargetthreadIndex: %d, TargetBlockIndex: %d, TargetTileIndex: %d\n", targetThreadIdx, targetBlockIdx, targetTileIndex);
+			printf("Sum Squared Tile 32x32:\n");
 			for (int i = 0; i < 32; i++){
 				for (int j = 0; j < 32; j++){
 					printf("%f ", __half2float(outputTile[i][j]));
 				}
-				printf("\n");
+			printf("\n");
 			}
 		}
+#endif
 
+#ifdef TIMING
+		stopSumSquared = clock64();
+		totalSumSquared += stopSumSquared - startSumSquared;
+		startMMA = clock64();
 #endif
 
 		wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
@@ -326,7 +317,7 @@ __global__ void assign_labels(float* centroids, float* particles, float* newCent
 			wmma::load_matrix_sync(a_frag, &(particlesTile[0][16]), 32);
 			wmma::load_matrix_sync(b_frag, &(centroidsTile[16][0]), 32);
 			mma_sync(c_frag, a_frag, b_frag, c_frag);
-			wmma::store_matrix_sync(&(mmaOutputTile[0][0]), c_frag, 32, wmma::mem_row_major);
+			wmma::store_matrix_sync(&(outputTile[0][0]), c_frag, 32, wmma::mem_row_major);
 		}
 
 		// warp 1 to do the next two
@@ -341,7 +332,7 @@ __global__ void assign_labels(float* centroids, float* particles, float* newCent
 			wmma::load_matrix_sync(a_frag, &(particlesTile[0][16]), 32);
 			wmma::load_matrix_sync(b_frag, &(centroidsTile[16][16]), 32);
 			mma_sync(c_frag, a_frag, b_frag, c_frag);
-			wmma::store_matrix_sync(&(mmaOutputTile[0][16]), c_frag, 32, wmma::mem_row_major);
+			wmma::store_matrix_sync(&(outputTile[0][16]), c_frag, 32, wmma::mem_row_major);
 		}
 
 		// warp 2 to do the next two
@@ -356,7 +347,7 @@ __global__ void assign_labels(float* centroids, float* particles, float* newCent
 			wmma::load_matrix_sync(a_frag, &(particlesTile[16][16]), 32);
 			wmma::load_matrix_sync(b_frag, &(centroidsTile[16][0]), 32);
 			mma_sync(c_frag, a_frag, b_frag, c_frag);
-			wmma::store_matrix_sync(&(mmaOutputTile[16][0]), c_frag, 32, wmma::mem_row_major);
+			wmma::store_matrix_sync(&(outputTile[16][0]), c_frag, 32, wmma::mem_row_major);
 		}
 
 		// warp 3 to do the last two
@@ -371,7 +362,7 @@ __global__ void assign_labels(float* centroids, float* particles, float* newCent
 			wmma::load_matrix_sync(a_frag, &(particlesTile[16][16]), 32);
 			wmma::load_matrix_sync(b_frag, &(centroidsTile[16][16]), 32);
 			mma_sync(c_frag, a_frag, b_frag, c_frag);
-			wmma::store_matrix_sync(&(mmaOutputTile[16][16]), c_frag, 32, wmma::mem_row_major);
+			wmma::store_matrix_sync(&(outputTile[16][16]), c_frag, 32, wmma::mem_row_major);
 		}
 		__syncthreads();
 
@@ -388,7 +379,7 @@ __global__ void assign_labels(float* centroids, float* particles, float* newCent
 			printf("Output Tile 32x32:\n");
 			for (int i = 0; i < 32; i++){
 				for (int j = 0; j < 32; j++){
-					printf("%f ", __half2float(mmaOutputTile[i][j]));
+					printf("%f ", __half2float(outputTile[i][j]));
 				}
 				printf("\n");
 			}
@@ -396,23 +387,17 @@ __global__ void assign_labels(float* centroids, float* particles, float* newCent
 #endif
 
 			long int minIndex = 0;
-			half minDistance = __habs(mmaOutputTile[threadIdx.x][0]);
+			half minDistance = __habs(outputTile[threadIdx.x][0]);
 			half tempDistance;
 			
 			for (long int step = 1; step < 32; step++){
-				tempDistance = __habs(mmaOutputTile[threadIdx.x][step]);
+				tempDistance = __habs(outputTile[threadIdx.x][step]);
 				if (tempDistance < minDistance){
 					minDistance = tempDistance;
 					minIndex = step;
 				}
 			}
 			output[blockIdx.x * rowsPerBlock + tileIndex * 32 + threadIdx.x] = minIndex;
-
-			int centroidOutIndex;
-			for (int i = 0; i < 32; i++){
-				centroidOutIndex = __shfl_sync(0xffffffff, minIndex, i);
-				newCentroidsTile[centroidOutIndex][threadIdx.x] += particlesTile[centroidOutIndex][threadIdx.x];
-			}
 		}
 
 #ifdef TIMING
@@ -434,20 +419,11 @@ __global__ void assign_labels(float* centroids, float* particles, float* newCent
 		printf("Kernel Time: %lu\n", totalKernel);
 		printf("Load Time: %lu\n", totalLoad);
 		printf("Sum Squared Time: %lu\n", totalSumSquared);
-		printf("Sum Squared 2 Time: %lu\n", totalSumSquared2);
 		printf("MMA Time: %lu\n", totalMMA);
 		printf("Store Time: %lu\n", totalStore);
 		printf("\n");
 	}
 #endif
-
-	// write out new centroids
-	if (warpIndex == 0){
-		for (int i = 0; i < K; i++){
-			newCentroids[blockIdx.x * K * N + i * K + threadIdx.x] = __half2float(newCentroidsTile[i][threadIdx.x]);
-		}
-	}
-
 }
 
 int main() {
@@ -497,13 +473,6 @@ int main() {
 		return 1;
 	}
 
-	float* newCentroids;
-	err = cudaMalloc(&newCentroids, size_c * NBLOCKS);
-	if (err != cudaSuccess) {
-		std::cout << cudaGetErrorString(err) << std::endl;
-		return 1;
-	}
-
 	float* particles;
 	err=cudaMalloc(&particles, size_p);
 	if (err != cudaSuccess) {
@@ -547,7 +516,7 @@ int main() {
 
 	for (long int run = 0; run < numRuns; run++) {
 		cudaEventRecord(start);
-		assign_labels<<<NBLOCKS, NTHREADS>>>(centroids, particles, newCentroids, output, dim, nParticles, nCentroids);
+		assign_labels<<<NBLOCKS, NTHREADS>>>(centroids, particles, output, dim, nParticles, nCentroids);
 		cudaEventRecord(end);
 		cudaEventSynchronize(end);
 		cudaDeviceSynchronize();

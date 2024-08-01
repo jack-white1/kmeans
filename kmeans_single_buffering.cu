@@ -5,7 +5,6 @@
 #include <cuda.h>
 #include <mma.h>
 #include <cuda_fp16.h>
-#include <cuda_pipeline.h>
 
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
@@ -25,8 +24,7 @@ const long int WMMA_K = 16;
 #define NTHREADS 128
 
 //#define DEBUG 1
-//#define TIMING 1
-//#define DOUBLE_BUFFER 1
+#define TIMING 1
 
 __global__ void assign_labels_very_slowly(float *centroids, float *particles, int32_t *output, int32_t dimensions, int32_t nParticles, int32_t nCentroids)
 {
@@ -50,37 +48,39 @@ __global__ void assign_labels_very_slowly(float *centroids, float *particles, in
             }
         }
         output[idx] = closestCentroidIdx;
+		//if (idx < 32){
+		//	printf("OLD METHOD Particle %d assigned to centroid %d\n", idx, closestCentroidIdx);
+		//}
     }
 }
 
-__global__ void assign_labels(float* centroids, float* particles, float* newCentroids, int32_t* output, int32_t dim, int32_t nParticles, int32_t nCentroids) {
-#ifdef TIMING
-	unsigned long int startKernel, stopKernel, totalKernel;
-	unsigned long int startLoad, stopLoad, totalLoad;
-	unsigned long int startSumSquared, stopSumSquared, totalSumSquared;
-	unsigned long int startSumSquared2, stopSumSquared2, totalSumSquared2;
-	unsigned long int startMMA, stopMMA, totalMMA;
-	unsigned long int startStore, stopStore, totalStore;
-	startKernel = clock64();
-	totalKernel = 0;
-	totalLoad = 0;
-	totalSumSquared = 0;
-	totalSumSquared2 = 0;
-	totalMMA = 0;
-	totalStore = 0;
-#endif
-	__shared__ half        centroidsTile[K][N];
-    __shared__ half        particlesTile[K][N];
-    __shared__ half           outputTile[K][N];
-	__shared__ half 	   mmaOutputTile[K][N];
-	__shared__ half 	newCentroidsTile[K][N];
-
-	__shared__ float   nextParticlesTile[K][N];
+__global__ void assign_labels(float* centroids, float* particles, int32_t* output, int32_t dim, int32_t nParticles, int32_t nCentroids) {
+	__shared__ half        centroidsTile[K*N];
+    __shared__ half        particlesTile[K*N];
+    __shared__ half           outputTile[K*N];
 
     long int rowsPerBlock = M / NBLOCKS;
 	long int tilesPerBlock = M / NBLOCKS / K;
 
-	int warpIndex = threadIdx.x / 32;
+#ifdef TIMING
+	unsigned long int startKernel, stopKernel, totalKernel;
+	unsigned long int startLoad, stopLoad, totalLoad;
+	unsigned long int startStore, stopStore, totalStore;
+	unsigned long int startMatmul, stopMatmul, totalMatmul;
+	unsigned long int startSumsq, stopSumsq, totalSumsq;
+	unsigned long int startMmaLoad, stopMmaLoad, totalMmaLoad;
+	unsigned long int startMmaSync, stopMmaSync, totalMmaSync;
+	unsigned long int startMmaStore, stopMmaStore, totalMmaStore;
+	totalKernel = 0;
+	totalLoad = 0;
+	totalStore = 0;
+	totalMatmul = 0;
+	totalSumsq = 0;
+	totalMmaLoad = 0;
+	totalMmaSync = 0;
+	totalMmaStore = 0;
+	startKernel = clock64();
+#endif
 	
 #ifdef DEBUG
 	int targetThreadIdx = 0;
@@ -91,28 +91,22 @@ __global__ void assign_labels(float* centroids, float* particles, float* newCent
 	}
 #endif
 
-	// transpose the centroids tile on the load
-	if (warpIndex == 0){
+	// transpose the tile on the load
+	if (threadIdx.x < 32){
 		for (int i = 0; i < K; i++){
-			centroidsTile[threadIdx.x][i] = __float2half(centroids[i * N + threadIdx.x]);
+			centroidsTile[threadIdx.x * N + i] = __float2half(centroids[i * N + threadIdx.x]);
 		}
 	}
-
-	// set newCentroids to zero
-	for (int i = 0; i < K; i++){
-		newCentroidsTile[i][threadIdx.x] = __float2half(0.0f);
-	}
-
 
     half myCentroidSquaredVal = __float2half(0.0f);
     half newCentroidValue;
 
-	__syncthreads();
-	for (long int step = 0; step < 32; step++){
-		newCentroidValue = centroidsTile[step][threadIdx.x%32];
-		myCentroidSquaredVal += newCentroidValue * newCentroidValue;
+	if (threadIdx.x < 32){
+		for (long int step = 0; step < 32; step++){
+			newCentroidValue = centroidsTile[step * 32 + threadIdx.x];
+			myCentroidSquaredVal += newCentroidValue * newCentroidValue;
+		}
 	}
-
 
 #ifdef DEBUG
 	if (blockIdx.x == targetBlockIdx){
@@ -130,108 +124,35 @@ __global__ void assign_labels(float* centroids, float* particles, float* newCent
 			printf("Particles Offset: %ld\n", particlesOffset);
 		}
 #endif
+
+		float4* startingPointer4 = reinterpret_cast<float4*>(&(particles[particlesOffset]));
+		float4 temp[2];
+
 #ifdef TIMING
 		startLoad = clock64();
 #endif
-
-#ifndef DOUBLE_BUFFER
-		// Directly load the tile
-		float4* startingPointer4 = reinterpret_cast<float4*>(&(particles[particlesOffset]));
-		float4 temp0 = startingPointer4[threadIdx.x];
-		float4 temp1 = startingPointer4[threadIdx.x + 128];
-
-		int index0, index1, index2, index3, index4, index5, index6, index7;
-		index0 = 4 * threadIdx.x;
-		index1 = 4 * threadIdx.x + 1;
-		index2 = 4 * threadIdx.x + 2;
-		index3 = 4 * threadIdx.x + 3;
-		index4 = 4 * threadIdx.x + 512;
-		index5 = 4 * threadIdx.x + 513;
-		index6 = 4 * threadIdx.x + 514;
-		index7 = 4 * threadIdx.x + 515;
-		
-		particlesTile[index0 / 32][index0 % 32] = __float2half(temp0.x);
-		particlesTile[index1 / 32][index1 % 32] = __float2half(temp0.y);
-		particlesTile[index2 / 32][index2 % 32] = __float2half(temp0.z);
-		particlesTile[index3 / 32][index3 % 32] = __float2half(temp0.w);
-		particlesTile[index4 / 32][index4 % 32] = __float2half(temp1.x);
-		particlesTile[index5 / 32][index5 % 32] = __float2half(temp1.y);
-		particlesTile[index6 / 32][index6 % 32] = __float2half(temp1.z);
-		particlesTile[index7 / 32][index7 % 32] = __float2half(temp1.w);
-#endif
-
-
-#ifdef DOUBLE_BUFFER
-		int row = threadIdx.x / 32;
-		int col = threadIdx.x % 32;
-
-		int row2 = threadIdx.x / 32 + 4;
-		int col2 = col;
-		if (tileIndex == 0) {
-            // Directly load the first tile
-            float4* startingPointer4 = reinterpret_cast<float4*>(&(particles[particlesOffset]));
-            float4 temp0 = startingPointer4[threadIdx.x];
-            float4 temp1 = startingPointer4[threadIdx.x + 128];
-			
-            particlesTile[row][col] = __float2half(temp0.x);
-            particlesTile[row][col + 1] = __float2half(temp0.y);
-			particlesTile[row][col + 2] = __float2half(temp0.z);
-			particlesTile[row][col + 3] = __float2half(temp0.w);
-			particlesTile[row2][col2] = __float2half(temp1.x);
-			particlesTile[row2][col2 + 1] = __float2half(temp1.y);
-			particlesTile[row2][col2 + 2] = __float2half(temp1.z);
-			particlesTile[row2][col2 + 3] = __float2half(temp1.w);
-
-            // Start asynchronous copy for the next tile
-            __pipeline_memcpy_async(&(nextParticlesTile[row][col]), &(particles[particlesOffset + 32 * 32 + threadIdx.x]), 4, 0);
-			__pipeline_memcpy_async(&(nextParticlesTile[row + 4][col]), &(particles[particlesOffset + 32 * 32 + 128 + threadIdx.x]), 4, 0);
-			__pipeline_memcpy_async(&(nextParticlesTile[row + 8][col]), &(particles[particlesOffset + 32 * 32 + 256 + threadIdx.x]), 4, 0);
-			__pipeline_memcpy_async(&(nextParticlesTile[row + 12][col]), &(particles[particlesOffset + 32 * 32 + 384 + threadIdx.x]), 4, 0);
-			__pipeline_memcpy_async(&(nextParticlesTile[row + 16][col]), &(particles[particlesOffset + 32 * 32 + 512 + threadIdx.x]), 4, 0);
-			__pipeline_memcpy_async(&(nextParticlesTile[row + 20][col]), &(particles[particlesOffset + 32 * 32 + 640 + threadIdx.x]), 4, 0);
-			__pipeline_memcpy_async(&(nextParticlesTile[row + 24][col]), &(particles[particlesOffset + 32 * 32 + 768 + threadIdx.x]), 4, 0);
-			__pipeline_memcpy_async(&(nextParticlesTile[row + 28][col]), &(particles[particlesOffset + 32 * 32 + 896 + threadIdx.x]), 4, 0);
-            __pipeline_commit();
-        } else {
-            // Wait for the previous copy to complete
-            __pipeline_wait_prior(0);
-
-            // Use the data from nextParticlesTile
-			particlesTile[row][col] = __float2half(nextParticlesTile[row][col]);
-			particlesTile[row+4][col] = __float2half(nextParticlesTile[row + 4][col]);
-			particlesTile[row+8][col] = __float2half(nextParticlesTile[row + 8][col]);
-			particlesTile[row+12][col] = __float2half(nextParticlesTile[row + 12][col]);
-			particlesTile[row+16][col] = __float2half(nextParticlesTile[row + 16][col]);
-			particlesTile[row+20][col] = __float2half(nextParticlesTile[row + 20][col]);
-			particlesTile[row+24][col] = __float2half(nextParticlesTile[row + 24][col]);
-			particlesTile[row+28][col] = __float2half(nextParticlesTile[row + 28][col]);
-
-            // Start asynchronous copy for the next tile
-			__pipeline_memcpy_async(&(nextParticlesTile[row][col]), &(particles[particlesOffset + 32 * 32 + threadIdx.x]), 4, 0);
-			__pipeline_memcpy_async(&(nextParticlesTile[row + 4][col]), &(particles[particlesOffset + 32 * 32 + 128 + threadIdx.x]), 4, 0);
-			__pipeline_memcpy_async(&(nextParticlesTile[row + 8][col]), &(particles[particlesOffset + 32 * 32 + 256 + threadIdx.x]), 4, 0);
-			__pipeline_memcpy_async(&(nextParticlesTile[row + 12][col]), &(particles[particlesOffset + 32 * 32 + 384 + threadIdx.x]), 4, 0);
-			__pipeline_memcpy_async(&(nextParticlesTile[row + 16][col]), &(particles[particlesOffset + 32 * 32 + 512 + threadIdx.x]), 4, 0);
-			__pipeline_memcpy_async(&(nextParticlesTile[row + 20][col]), &(particles[particlesOffset + 32 * 32 + 640 + threadIdx.x]), 4, 0);
-			__pipeline_memcpy_async(&(nextParticlesTile[row + 24][col]), &(particles[particlesOffset + 32 * 32 + 768 + threadIdx.x]), 4, 0);
-			__pipeline_memcpy_async(&(nextParticlesTile[row + 28][col]), &(particles[particlesOffset + 32 * 32 + 896 + threadIdx.x]), 4, 0);
-            __pipeline_commit();
-        }
-#endif
+		for (int i = 0; i < 2; i++){
+			temp[i] = startingPointer4[i*128 + threadIdx.x];
+			particlesTile[threadIdx.x * 4 + 512 * i] = __float2half(temp[i].x);
+			particlesTile[threadIdx.x * 4 + 512 * i + 1] = __float2half(temp[i].y);
+			particlesTile[threadIdx.x * 4 + 512 * i + 2] = __float2half(temp[i].z);
+			particlesTile[threadIdx.x * 4 + 512 * i + 3] = __float2half(temp[i].w);
+		}
 
 #ifdef TIMING
 		stopLoad = clock64();
 		totalLoad += stopLoad - startLoad;
-		startSumSquared = clock64();
 #endif
-
 
 		half mySquaredVal = __float2half(0.0f);
 		half newValue, outValue;
 		
-		if (warpIndex == 0){
+		if (threadIdx.x < 32){
+#ifdef TIMING
+			startSumsq = clock64();
+#endif
 			for (long int step = 0; step < K; step++){
-				newValue = particlesTile[threadIdx.x][step];
+				newValue = particlesTile[threadIdx.x * K + step];
 				mySquaredVal += newValue * newValue;
 			}
 
@@ -244,151 +165,262 @@ __global__ void assign_labels(float* centroids, float* particles, float* newCent
 
 			for (long int step = 0; step < K; step++){
 				outValue = __float2half(-0.5) * (mySquaredVal + __shfl_sync(0xffffffff, myCentroidSquaredVal, step));
-				outputTile[threadIdx.x][step] = outValue;
+				outputTile[threadIdx.x * K + step] = outValue;
 			}
-		}
-
+		}	
 #ifdef TIMING
-		stopSumSquared = clock64();
-		totalSumSquared += stopSumSquared - startSumSquared;
-		startSumSquared2 = clock64();
+		stopSumsq = clock64();
+		totalSumsq += stopSumsq - startSumsq;
 #endif
 
-		/*
-		__syncthreads();
-		// non warpzero version
-		#pragma unroll
-		for (int step = 0; step < 8; step++){
-			int myRow = (threadIdx.x / 32) + 4 * step;
-			int myCol = threadIdx.x % 32;
-			half myVal = particlesTile[myRow][myCol];
-			half myValSquared = myVal * myVal;
-			// warp sum reduce myValSquared
-			for (int i = 16; i > 0; i /= 2){
-				myValSquared += __shfl_down_sync(0xffffffff, myValSquared, i);
-			}
-			myValSquared = __shfl_sync(0xffffffff, myValSquared, 0);
-			// calculate the output value
-			half outVal = __float2half(-0.5) * (myValSquared + myCentroidSquaredVal);
-			outputTile[myRow][myCol] = outVal;
-		}
-		__syncthreads();
-		*/
-
-
-#ifdef TIMING
-		stopSumSquared2 = clock64();
-		totalSumSquared2 += stopSumSquared2 - startSumSquared2;
-		startMMA = clock64();
-#endif
 #ifdef DEBUG
-
 		if (threadIdx.x == targetThreadIdx && blockIdx.x == targetBlockIdx && tileIndex == targetTileIndex){
-			printf("\nCentroids Tile 32x32: (on wmma entry)\n");
+			printf("TargetthreadIndex: %d, TargetBlockIndex: %d, TargetTileIndex: %d\n", targetThreadIdx, targetBlockIdx, targetTileIndex);
+			printf("Centroids Tile 32x32 (should be transposed vs GMEM version):\n");
 			for (int i = 0; i < 32; i++){
 				for (int j = 0; j < 32; j++){
-					printf("%f ", __half2float(centroidsTile[i][j]));
+					printf("%f ", __half2float(centroidsTile[i * 32 + j]));
 				}
 				printf("\n");
 			}
-			printf("\nParticles Tile 32x32: (on wmma entry)\n");
+			printf("\n");
+			printf("TargetthreadIndex: %d, TargetBlockIndex: %d, TargetTileIndex: %d\n", targetThreadIdx, targetBlockIdx, targetTileIndex);
+			printf("Particles Tile 32x32:\n");
 			for (int i = 0; i < 32; i++){
 				for (int j = 0; j < 32; j++){
-					printf("%f ", __half2float(particlesTile[i][j]));
+					printf("%f ", __half2float(particlesTile[i * 32 + j]));
 				}
 				printf("\n");
 			}
-			printf("\nOutput Tile 32x32: (on wmma entry)\n");
+			printf("\n");
+			printf("TargetthreadIndex: %d, TargetBlockIndex: %d, TargetTileIndex: %d\n", targetThreadIdx, targetBlockIdx, targetTileIndex);
+			printf("Sum Squared Tile 32x32:\n");
 			for (int i = 0; i < 32; i++){
 				for (int j = 0; j < 32; j++){
-					printf("%f ", __half2float(outputTile[i][j]));
+					printf("%f ", __half2float(outputTile[i * 32 + j]));
 				}
-				printf("\n");
+			printf("\n");
 			}
 		}
-
 #endif
 
 		wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
 		wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> b_frag;
 		wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> c_frag;
 
+#ifdef TIMING
+		startMatmul = clock64();
+#endif
+		int warpIndex = threadIdx.x / 32;
 		// warp 0 to do the first two
 		__syncthreads();
 		if (warpIndex == 0){
 			// top left corner of A, top left corner of B, C = 0.0f, top left corner of output
-			wmma::load_matrix_sync(a_frag, &(particlesTile[0][0]), 32);
-			wmma::load_matrix_sync(b_frag, &(centroidsTile[0][0]), 32);
-			wmma::load_matrix_sync(c_frag, &(outputTile[0][0]), 32, wmma::mem_row_major);
+#ifdef TIMING
+			startMmaLoad = clock64();
+#endif
+			wmma::load_matrix_sync(a_frag, particlesTile, 32);
+			wmma::load_matrix_sync(b_frag, centroidsTile, 32);
+			wmma::load_matrix_sync(c_frag, outputTile, 32, wmma::mem_row_major);
+#ifdef TIMING
+			stopMmaLoad = clock64();
+			totalMmaLoad += stopMmaLoad - startMmaLoad;
+			startMmaSync = clock64();
+#endif
 			mma_sync(c_frag, a_frag, b_frag, c_frag);
+#ifdef TIMING
+			stopMmaSync = clock64();
+			totalMmaSync += stopMmaSync - startMmaSync;
+			startMmaStore = clock64();
+#endif
+			wmma::store_matrix_sync(outputTile, c_frag, 32, wmma::mem_row_major);
+#ifdef TIMING
+			stopMmaStore = clock64();
+			totalMmaStore += stopMmaStore - startMmaStore;
+			startMmaLoad = clock64();
+#endif
 			
 			// top right corner of A, bottom left corner of B, top left corner of C, top left corner of output
-			wmma::load_matrix_sync(a_frag, &(particlesTile[0][16]), 32);
-			wmma::load_matrix_sync(b_frag, &(centroidsTile[16][0]), 32);
+			wmma::load_matrix_sync(a_frag, particlesTile + 16, 32);
+			wmma::load_matrix_sync(b_frag, centroidsTile + 32*16, 32);
+			wmma::load_matrix_sync(c_frag, outputTile, 32, wmma::mem_row_major);
+#ifdef TIMING
+			stopMmaLoad = clock64();
+			totalMmaLoad += stopMmaLoad - startMmaLoad;
+			startMmaSync = clock64();
+#endif
 			mma_sync(c_frag, a_frag, b_frag, c_frag);
-			wmma::store_matrix_sync(&(mmaOutputTile[0][0]), c_frag, 32, wmma::mem_row_major);
+#ifdef TIMING
+			stopMmaSync = clock64();
+			totalMmaSync += stopMmaSync - startMmaSync;
+			startMmaStore = clock64();
+#endif
+			wmma::store_matrix_sync(outputTile, c_frag, 32, wmma::mem_row_major);
+#ifdef TIMING
+			stopMmaStore = clock64();
+			totalMmaStore += stopMmaStore - startMmaStore;	
+#endif
 		}
 
 		// warp 1 to do the next two
-		if (warpIndex == 1){
+		if (warpIndex == 0){
 			// top left corner of A, top right corner of B, C = 0.0f, top right corner of output
-			wmma::load_matrix_sync(a_frag, &(particlesTile[0][0]), 32);
-			wmma::load_matrix_sync(b_frag, &(centroidsTile[0][16]), 32);
-			wmma::load_matrix_sync(c_frag, &(outputTile[0][16]), 32, wmma::mem_row_major);
+#ifdef TIMING
+			startMmaLoad = clock64();
+#endif
+			wmma::load_matrix_sync(a_frag, particlesTile, 32);
+			wmma::load_matrix_sync(b_frag, centroidsTile + 16, 32);
+			wmma::load_matrix_sync(c_frag, outputTile+16, 32, wmma::mem_row_major);
+#ifdef TIMING
+			stopMmaLoad = clock64();
+			totalMmaLoad += stopMmaLoad - startMmaLoad;
+			startMmaSync = clock64();
+#endif
 			mma_sync(c_frag, a_frag, b_frag, c_frag);
+#ifdef TIMING
+			stopMmaSync = clock64();
+			totalMmaSync += stopMmaSync - startMmaSync;
+			startMmaStore = clock64();
+#endif
+			wmma::store_matrix_sync(outputTile+16, c_frag, 32, wmma::mem_row_major);
+#ifdef TIMING
+			stopMmaStore = clock64();
+			totalMmaStore += stopMmaStore - startMmaStore;
+			startMmaLoad = clock64();
+#endif
 
 			// top right corner of A, bottom right corner of B, top right corner of C, top right corner of output
-			wmma::load_matrix_sync(a_frag, &(particlesTile[0][16]), 32);
-			wmma::load_matrix_sync(b_frag, &(centroidsTile[16][16]), 32);
+			wmma::load_matrix_sync(a_frag, particlesTile + 16, 32);
+			wmma::load_matrix_sync(b_frag, centroidsTile + 32*16 + 16, 32);
+			wmma::load_matrix_sync(c_frag, outputTile+16, 32, wmma::mem_row_major);
+#ifdef TIMING
+			stopMmaLoad = clock64();
+			totalMmaLoad += stopMmaLoad - startMmaLoad;
+			startMmaSync = clock64();
+#endif
 			mma_sync(c_frag, a_frag, b_frag, c_frag);
-			wmma::store_matrix_sync(&(mmaOutputTile[0][16]), c_frag, 32, wmma::mem_row_major);
+#ifdef TIMING
+			stopMmaSync = clock64();
+			totalMmaSync += stopMmaSync - startMmaSync;
+			startMmaStore = clock64();
+#endif
+			wmma::store_matrix_sync(outputTile+16, c_frag, 32, wmma::mem_row_major);
+#ifdef TIMING
+			stopMmaStore = clock64();
+			totalMmaStore += stopMmaStore - startMmaStore;
+#endif
 		}
 
 		// warp 2 to do the next two
-		if (warpIndex == 2){
+		if (warpIndex == 0){
 			// bottom left corner of A, top left corner of B, C = 0.0f, bottom left corner of output
-			wmma::load_matrix_sync(a_frag, &(particlesTile[16][0]), 32);
-			wmma::load_matrix_sync(b_frag, &(centroidsTile[0][0]), 32);
-			wmma::load_matrix_sync(c_frag, &(outputTile[16][0]), 32, wmma::mem_row_major);
+#ifdef TIMING
+			startMmaLoad = clock64();
+#endif
+			wmma::load_matrix_sync(a_frag, particlesTile + 16*32, 32);
+			wmma::load_matrix_sync(b_frag, centroidsTile, 32);
+			wmma::load_matrix_sync(c_frag, outputTile + 32*16, 32, wmma::mem_row_major);
+#ifdef TIMING
+			stopMmaLoad = clock64();
+			totalMmaLoad += stopMmaLoad - startMmaLoad;
+			startMmaSync = clock64();
+#endif
 			mma_sync(c_frag, a_frag, b_frag, c_frag);
-
+#ifdef TIMING
+			stopMmaSync = clock64();
+			totalMmaSync += stopMmaSync - startMmaSync;
+			startMmaStore = clock64();
+#endif
+			wmma::store_matrix_sync(outputTile + 32 * 16, c_frag, 32, wmma::mem_row_major);
+#ifdef TIMING
+			stopMmaStore = clock64();
+			totalMmaStore += stopMmaStore - startMmaStore;
+			startMmaLoad = clock64();
+#endif
 			// bottom right corner of A, bottom left corner of B, bottom left corner of C, bottom left corner of output
-			wmma::load_matrix_sync(a_frag, &(particlesTile[16][16]), 32);
-			wmma::load_matrix_sync(b_frag, &(centroidsTile[16][0]), 32);
+			wmma::load_matrix_sync(a_frag, particlesTile + 16*32 + 16, 32);
+			wmma::load_matrix_sync(b_frag, centroidsTile + 32*16, 32);
+			wmma::load_matrix_sync(c_frag, outputTile + 32 * 16, 32, wmma::mem_row_major);
+#ifdef TIMING
+			stopMmaLoad = clock64();
+			totalMmaLoad += stopMmaLoad - startMmaLoad;
+			startMmaSync = clock64();
+#endif
 			mma_sync(c_frag, a_frag, b_frag, c_frag);
-			wmma::store_matrix_sync(&(mmaOutputTile[16][0]), c_frag, 32, wmma::mem_row_major);
+#ifdef TIMING
+			stopMmaSync = clock64();
+			totalMmaSync += stopMmaSync - startMmaSync;
+			startMmaStore = clock64();
+#endif
+			wmma::store_matrix_sync(outputTile + 32 * 16, c_frag, 32, wmma::mem_row_major);
+#ifdef TIMING
+			stopMmaStore = clock64();
+			totalMmaStore += stopMmaStore - startMmaStore;
+#endif
 		}
 
 		// warp 3 to do the last two
-		if (warpIndex == 3){
+		if (warpIndex == 0){
 			// bottom left corner of A, top right corner of B, C = 0.0f, bottom right corner of output
-			wmma::load_matrix_sync(a_frag, &(particlesTile[16][0]), 32);
-			wmma::load_matrix_sync(b_frag, &(centroidsTile[0][16]), 32);
-			wmma::load_matrix_sync(c_frag, &(outputTile[16][16]), 32, wmma::mem_row_major);
+#ifdef TIMING
+			startMmaLoad = clock64();
+#endif
+			wmma::load_matrix_sync(a_frag, particlesTile + 16*32, 32);
+			wmma::load_matrix_sync(b_frag, centroidsTile + 16, 32);
+			wmma::load_matrix_sync(c_frag, outputTile + 32 * 16 + 16, 32, wmma::mem_row_major);
+#ifdef TIMING
+			stopMmaLoad = clock64();
+			totalMmaLoad += stopMmaLoad - startMmaLoad;
+			startMmaSync = clock64();
+#endif
 			mma_sync(c_frag, a_frag, b_frag, c_frag);
+#ifdef TIMING
+			stopMmaSync = clock64();
+			totalMmaSync += stopMmaSync - startMmaSync;
+			startMmaStore = clock64();
+#endif
+			wmma::store_matrix_sync(outputTile + 32 * 16 + 16, c_frag, 32, wmma::mem_row_major);
+#ifdef TIMING
+			stopMmaStore = clock64();
+			totalMmaStore += stopMmaStore - startMmaStore;
+			startMmaLoad = clock64();
+#endif
 
 			// bottom right corner of A, bottom right corner of B, bottom right corner of C, bottom right corner of output
-			wmma::load_matrix_sync(a_frag, &(particlesTile[16][16]), 32);
-			wmma::load_matrix_sync(b_frag, &(centroidsTile[16][16]), 32);
+			wmma::load_matrix_sync(a_frag, particlesTile + 16*32 + 16, 32);
+			wmma::load_matrix_sync(b_frag, centroidsTile + 16*32 + 16, 32);
+			wmma::load_matrix_sync(c_frag, outputTile + 32 * 16 + 16, 32, wmma::mem_row_major);
+#ifdef TIMING
+			stopMmaLoad = clock64();
+			totalMmaLoad += stopMmaLoad - startMmaLoad;
+			startMmaSync = clock64();
+#endif
 			mma_sync(c_frag, a_frag, b_frag, c_frag);
-			wmma::store_matrix_sync(&(mmaOutputTile[16][16]), c_frag, 32, wmma::mem_row_major);
+#ifdef TIMING
+			stopMmaSync = clock64();
+			totalMmaSync += stopMmaSync - startMmaSync;
+			startMmaStore = clock64();
+#endif
+			wmma::store_matrix_sync(outputTile + 32 * 16 + 16, c_frag, 32, wmma::mem_row_major);
+#ifdef TIMING
+			stopMmaStore = clock64();
+			totalMmaStore += stopMmaStore - startMmaStore;
+#endif
 		}
 		__syncthreads();
 
 #ifdef TIMING
-		stopMMA = clock64();
-		totalMMA += stopMMA - startMMA;
-		startStore = clock64();
+		stopMatmul = clock64();
+		totalMatmul += stopMatmul - startMatmul;
 #endif
-
-		if (warpIndex == 0){
+		if (threadIdx.x < 32){
 #ifdef DEBUG
 		if (threadIdx.x == targetThreadIdx && blockIdx.x == targetBlockIdx && tileIndex == targetTileIndex){
 			printf("TargetthreadIndex: %d, TargetBlockIndex: %d, TargetTileIndex: %d\n", targetThreadIdx, targetBlockIdx, targetTileIndex);
 			printf("Output Tile 32x32:\n");
 			for (int i = 0; i < 32; i++){
 				for (int j = 0; j < 32; j++){
-					printf("%f ", __half2float(mmaOutputTile[i][j]));
+					printf("%f ", __half2float(outputTile[i * 32 + j]));
 				}
 				printf("\n");
 			}
@@ -396,30 +428,25 @@ __global__ void assign_labels(float* centroids, float* particles, float* newCent
 #endif
 
 			long int minIndex = 0;
-			half minDistance = __habs(mmaOutputTile[threadIdx.x][0]);
+			half minDistance = __habs(outputTile[threadIdx.x * 32]);
 			half tempDistance;
 			
 			for (long int step = 1; step < 32; step++){
-				tempDistance = __habs(mmaOutputTile[threadIdx.x][step]);
+				tempDistance = __habs(outputTile[threadIdx.x * 32 + step]);
 				if (tempDistance < minDistance){
 					minDistance = tempDistance;
 					minIndex = step;
 				}
 			}
+#ifdef TIMING
+			startStore = clock64();
+#endif
 			output[blockIdx.x * rowsPerBlock + tileIndex * 32 + threadIdx.x] = minIndex;
-
-			int centroidOutIndex;
-			for (int i = 0; i < 32; i++){
-				centroidOutIndex = __shfl_sync(0xffffffff, minIndex, i);
-				newCentroidsTile[centroidOutIndex][threadIdx.x] += particlesTile[centroidOutIndex][threadIdx.x];
-			}
 		}
-
 #ifdef TIMING
 		stopStore = clock64();
 		totalStore += stopStore - startStore;
 #endif
-
 
 #ifdef DEBUG
 			if (blockIdx.x == targetBlockIdx && tileIndex == targetTileIndex){
@@ -431,23 +458,17 @@ __global__ void assign_labels(float* centroids, float* particles, float* newCent
 	stopKernel = clock64();
 	totalKernel += stopKernel - startKernel;
 	if (threadIdx.x == 0 && blockIdx.x == 0){
-		printf("Kernel Time: %lu\n", totalKernel);
-		printf("Load Time: %lu\n", totalLoad);
-		printf("Sum Squared Time: %lu\n", totalSumSquared);
-		printf("Sum Squared 2 Time: %lu\n", totalSumSquared2);
-		printf("MMA Time: %lu\n", totalMMA);
-		printf("Store Time: %lu\n", totalStore);
+		printf("Kernel Time: %ld\n", totalKernel);
+		printf("Load Time: %ld\n", totalLoad);
+		printf("Store Time: %ld\n", totalStore);
+		printf("Matmul Time: %ld\n", totalMatmul);
+		printf("Sumsq Time: %ld\n", totalSumsq);
+		printf("Mma Load Time: %ld\n", totalMmaLoad);
+		printf("Mma Sync Time: %ld\n", totalMmaSync);
+		printf("Mma Store Time: %ld\n", totalMmaStore);
 		printf("\n");
 	}
 #endif
-
-	// write out new centroids
-	if (warpIndex == 0){
-		for (int i = 0; i < K; i++){
-			newCentroids[blockIdx.x * K * N + i * K + threadIdx.x] = __half2float(newCentroidsTile[i][threadIdx.x]);
-		}
-	}
-
 }
 
 int main() {
@@ -497,13 +518,6 @@ int main() {
 		return 1;
 	}
 
-	float* newCentroids;
-	err = cudaMalloc(&newCentroids, size_c * NBLOCKS);
-	if (err != cudaSuccess) {
-		std::cout << cudaGetErrorString(err) << std::endl;
-		return 1;
-	}
-
 	float* particles;
 	err=cudaMalloc(&particles, size_p);
 	if (err != cudaSuccess) {
@@ -541,13 +555,10 @@ int main() {
 	long int numRuns = 100;
 	float totalSeconds = 0.0f;
 	float milliseconds = 0.0f;
-#ifdef DEBUG
-	numRuns = 1;
-#endif
 
 	for (long int run = 0; run < numRuns; run++) {
 		cudaEventRecord(start);
-		assign_labels<<<NBLOCKS, NTHREADS>>>(centroids, particles, newCentroids, output, dim, nParticles, nCentroids);
+		assign_labels<<<NBLOCKS, NTHREADS>>>(centroids, particles, output, dim, nParticles, nCentroids);
 		cudaEventRecord(end);
 		cudaEventSynchronize(end);
 		cudaDeviceSynchronize();
@@ -594,12 +605,6 @@ int main() {
 	}
 	for (int32_t i = 0; i < nCentroids; i++) {
 		std::cout << counts[i] << " (fast) vs " << counts_slow[i] << " (slow) particles were assigned to centroid " << i << std::endl;
-	}
-
-	err = cudaGetLastError();
-	if (err != cudaSuccess) {
-		std::cout << cudaGetErrorString(err) << std::endl;
-		return 1;
 	}
     return 0;
 }
