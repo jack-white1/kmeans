@@ -27,7 +27,7 @@ const long int WMMA_K = 16;
 //#define DEBUG 1
 //#define TIMING 1
 //#define DOUBLE_BUFFER 1
-#define MINIBATCH 1
+//#define MINIBATCH 1
 
 __global__ void assign_labels_very_slowly(float *centroids, float *particles, int32_t *output, int32_t dimensions, int32_t nParticles, int32_t nCentroids)
 {
