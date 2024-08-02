@@ -27,6 +27,7 @@ const long int WMMA_K = 16;
 //#define DEBUG 1
 //#define TIMING 1
 //#define DOUBLE_BUFFER 1
+#define MINIBATCH 1
 
 __global__ void assign_labels_very_slowly(float *centroids, float *particles, int32_t *output, int32_t dimensions, int32_t nParticles, int32_t nCentroids)
 {
@@ -38,9 +39,9 @@ __global__ void assign_labels_very_slowly(float *centroids, float *particles, in
         for (int32_t j = 0; j < nCentroids; j++)
         {
             float dist = 0;
-            for (int32_t k = 0; k < dimensions; k++)
+            for (int32_t dimension = 0; dimension < dimensions; dimension++)
             {
-                float d = centroids[j * dimensions + k] - particles[idx * dimensions + k];
+                float d = centroids[j * dimensions + dimension] - particles[idx * dimensions + dimension];
                 dist += d * d;
             }
             if (dist < lowestDist || closestCentroidIdx == -1)
@@ -53,7 +54,8 @@ __global__ void assign_labels_very_slowly(float *centroids, float *particles, in
     }
 }
 
-__global__ void assign_labels(float* centroids, float* particles, float* newCentroids, int32_t* output, int32_t dim, int32_t nParticles, int32_t nCentroids) {
+
+__global__ void assign_labels(float* centroids, float* particles, float* newCentroids, int32_t* globalCentroidCounts, int32_t* output, int32_t dim, int32_t nParticles, int32_t nCentroids) {
 #ifdef TIMING
 	unsigned long int startKernel, stopKernel, totalKernel;
 	unsigned long int startLoad, stopLoad, totalLoad;
@@ -73,9 +75,19 @@ __global__ void assign_labels(float* centroids, float* particles, float* newCent
     __shared__ half        particlesTile[K][N];
     __shared__ half           outputTile[K][N];
 	__shared__ half 	   mmaOutputTile[K][N];
+#ifdef MINIBATCH
 	__shared__ half 	newCentroidsTile[K][N];
+#endif
 
+#ifdef DOUBLE_BUFFER
 	__shared__ float   nextParticlesTile[K][N];
+#endif
+
+	__shared__ int32_t       centroidCounts[N];
+	
+	if (threadIdx.x < N){
+		centroidCounts[threadIdx.x] = 0;
+	}
 
     long int rowsPerBlock = M / NBLOCKS;
 	long int tilesPerBlock = M / NBLOCKS / K;
@@ -98,11 +110,12 @@ __global__ void assign_labels(float* centroids, float* particles, float* newCent
 		}
 	}
 
+#ifdef MINIBATCH
 	// set newCentroids to zero
 	for (int i = 0; i < K; i++){
 		newCentroidsTile[i][threadIdx.x] = __float2half(0.0f);
 	}
-
+#endif
 
     half myCentroidSquaredVal = __float2half(0.0f);
     half newCentroidValue;
@@ -407,12 +420,14 @@ __global__ void assign_labels(float* centroids, float* particles, float* newCent
 				}
 			}
 			output[blockIdx.x * rowsPerBlock + tileIndex * 32 + threadIdx.x] = minIndex;
-
+#ifdef MINIBATCH
 			int centroidOutIndex;
 			for (int i = 0; i < 32; i++){
 				centroidOutIndex = __shfl_sync(0xffffffff, minIndex, i);
 				newCentroidsTile[centroidOutIndex][threadIdx.x] += particlesTile[centroidOutIndex][threadIdx.x];
+				if (threadIdx.x == 0) centroidCounts[centroidOutIndex] += 1;
 			}
+#endif
 		}
 
 #ifdef TIMING
@@ -441,14 +456,45 @@ __global__ void assign_labels(float* centroids, float* particles, float* newCent
 	}
 #endif
 
+#ifdef MINIBATCH
 	// write out new centroids
 	if (warpIndex == 0){
 		for (int i = 0; i < K; i++){
 			newCentroids[blockIdx.x * K * N + i * K + threadIdx.x] = __half2float(newCentroidsTile[i][threadIdx.x]);
 		}
+		globalCentroidCounts[blockIdx.x * N + threadIdx.x] = centroidCounts[threadIdx.x];
 	}
+#endif
+}
+
+#ifdef MINIBATCH
+// assuming blockdim = (32,32)
+// assuming griddim = (1,1)
+__global__ void reduceCentroids(float* centroidsExtendedArray, float* newCentroids, int32_t* centroidCountsExtendedArray, int32_t* centroidCountsReduced){
+	float newCentroidsTile[K][N];
+	int32_t centroidCountsVector[N];
+	
+	if (threadIdx.y == 0) centroidCountsVector[threadIdx.x] = 0;
+	__syncthreads();
+
+	newCentroidsTile[threadIdx.y][threadIdx.x] = 0.0f;
+
+	for (int i = 0 ; i < 2048; i++){
+		newCentroidsTile[threadIdx.y][threadIdx.x] += newCentroids[i * K * N + threadIdx.y * K + threadIdx.x];
+		if (threadIdx.y == 0){
+			centroidCountsVector[threadIdx.x] += centroidCountsExtendedArray[i * N + threadIdx.x];
+		}
+	}
+	__syncthreads();
+
+	newCentroidsTile[threadIdx.y][threadIdx.x] /= (float)centroidCountsVector[threadIdx.y];
+	newCentroids[threadIdx.y*K + threadIdx.x] = newCentroidsTile[threadIdx.y][threadIdx.x];
+
+	__syncthreads();
+	if (threadIdx.y == 0 ) centroidCountsReduced[threadIdx.x] = centroidCountsVector[threadIdx.x];
 
 }
+#endif
 
 int main() {
 	// print GPU model name
@@ -497,6 +543,7 @@ int main() {
 		return 1;
 	}
 
+
 	float* newCentroids;
 	err = cudaMalloc(&newCentroids, size_c * NBLOCKS);
 	if (err != cudaSuccess) {
@@ -504,6 +551,15 @@ int main() {
 		return 1;
 	}
 
+
+	int32_t* centroidCounts;
+	err = cudaMalloc(&centroidCounts, nCentroids * sizeof(int32_t) * NBLOCKS);
+	err = cudaMemset(centroidCounts, 0, nCentroids * sizeof(int32_t) * NBLOCKS);
+	if (err != cudaSuccess) {
+		std::cout << cudaGetErrorString(err) << std::endl;
+		return 1;
+	}
+	
 	float* particles;
 	err=cudaMalloc(&particles, size_p);
 	if (err != cudaSuccess) {
@@ -547,15 +603,28 @@ int main() {
 
 	for (long int run = 0; run < numRuns; run++) {
 		cudaEventRecord(start);
-		assign_labels<<<NBLOCKS, NTHREADS>>>(centroids, particles, newCentroids, output, dim, nParticles, nCentroids);
+		assign_labels<<<NBLOCKS, NTHREADS, 32000>>>(centroids, particles, newCentroids, centroidCounts, output, dim, nParticles, nCentroids);
 		cudaEventRecord(end);
 		cudaEventSynchronize(end);
 		cudaDeviceSynchronize();
 		cudaEventElapsedTime(&milliseconds, start, end);
 		totalSeconds += milliseconds/1000;
 		milliseconds = 0.0f;
-
 	}
+
+	int32_t* centroidCountsReduced;
+	err = cudaMalloc(&centroidCountsReduced, nCentroids * sizeof(int32_t));
+	err = cudaMemset(centroidCountsReduced, 0, nCentroids * sizeof(int32_t));
+	if (err != cudaSuccess) {
+		std::cout << cudaGetErrorString(err) << std::endl;
+		return 1;
+	}
+
+#ifdef MINIBATCH
+	cudaDeviceSynchronize();
+	reduceCentroids<<<1, dim3(32,32)>>>(centroids, newCentroids, centroidCounts, centroidCountsReduced);
+	cudaDeviceSynchronize();
+#endif
 
 	std::cout << 1000*(totalSeconds / numRuns) << " ms average kernel execution time" << std::endl;
 	double memLoaded = numRuns * size_p; // approx
@@ -565,7 +634,6 @@ int main() {
 
 	cudaEventDestroy(start);
 	cudaEventDestroy(end);
-
 	assign_labels_very_slowly<<<(nParticles + 1 - NTHREADS) / NTHREADS, NTHREADS>>>(centroids, particles, output_slow, dim, nParticles, nCentroids);
 	cudaDeviceSynchronize();
 
