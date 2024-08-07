@@ -26,7 +26,7 @@ const long int WMMA_K = 16;
 
 //#define DEBUG 1
 //#define TIMING 1
-//#define DOUBLE_BUFFER 1
+#define DOUBLE_BUFFER 1
 //#define MINIBATCH 1
 
 __global__ void assign_labels_very_slowly(float *centroids, float *particles, int32_t *output, int32_t dimensions, int32_t nParticles, int32_t nCentroids)
@@ -84,7 +84,7 @@ __global__ void assign_labels(float* centroids, float* particles, float* newCent
 #endif
 
 	__shared__ int32_t       centroidCounts[N];
-	
+
 	if (threadIdx.x < N){
 		centroidCounts[threadIdx.x] = 0;
 	}
@@ -93,7 +93,7 @@ __global__ void assign_labels(float* centroids, float* particles, float* newCent
 	long int tilesPerBlock = M / NBLOCKS / K;
 
 	int warpIndex = threadIdx.x / 32;
-	
+
 #ifdef DEBUG
 	int targetThreadIdx = 0;
 	int targetBlockIdx = 1;
@@ -136,13 +136,14 @@ __global__ void assign_labels(float* centroids, float* particles, float* newCent
 
     for (long int tileIndex = 0; tileIndex < tilesPerBlock; tileIndex++){
         long int particlesOffset = blockIdx.x * rowsPerBlock * K + tileIndex*K*K;
-		
+
 #ifdef DEBUG
 		if (threadIdx.x == targetThreadIdx && blockIdx.x == targetBlockIdx && tileIndex == targetTileIndex){
 			printf("TargetthreadIndex: %d, TargetBlockIndex: %d, TargetTileIndex: %d\n", targetThreadIdx, targetBlockIdx, targetTileIndex);
 			printf("Particles Offset: %ld\n", particlesOffset);
 		}
 #endif
+
 #ifdef TIMING
 		startLoad = clock64();
 #endif
@@ -185,7 +186,7 @@ __global__ void assign_labels(float* centroids, float* particles, float* newCent
             float4* startingPointer4 = reinterpret_cast<float4*>(&(particles[particlesOffset]));
             float4 temp0 = startingPointer4[threadIdx.x];
             float4 temp1 = startingPointer4[threadIdx.x + 128];
-			
+
             particlesTile[row][col] = __float2half(temp0.x);
             particlesTile[row][col + 1] = __float2half(temp0.y);
 			particlesTile[row][col + 2] = __float2half(temp0.z);
@@ -205,14 +206,15 @@ __global__ void assign_labels(float* centroids, float* particles, float* newCent
 			__pipeline_memcpy_async(&(nextParticlesTile[row + 24][col]), &(particles[particlesOffset + 32 * 32 + 768 + threadIdx.x]), 4, 0);
 			__pipeline_memcpy_async(&(nextParticlesTile[row + 28][col]), &(particles[particlesOffset + 32 * 32 + 896 + threadIdx.x]), 4, 0);
             __pipeline_commit();
+
         } else {
             // Wait for the previous copy to complete
             __pipeline_wait_prior(0);
 
             // Use the data from nextParticlesTile
-			particlesTile[row][col] = __float2half(nextParticlesTile[row][col]);
-			particlesTile[row+4][col] = __float2half(nextParticlesTile[row + 4][col]);
-			particlesTile[row+8][col] = __float2half(nextParticlesTile[row + 8][col]);
+			particlesTile[row][col] =    __float2half(nextParticlesTile[row][col]);
+			particlesTile[row+4][col] =  __float2half(nextParticlesTile[row + 4][col]);
+			particlesTile[row+8][col] =  __float2half(nextParticlesTile[row + 8][col]);
 			particlesTile[row+12][col] = __float2half(nextParticlesTile[row + 12][col]);
 			particlesTile[row+16][col] = __float2half(nextParticlesTile[row + 16][col]);
 			particlesTile[row+20][col] = __float2half(nextParticlesTile[row + 20][col]);
@@ -220,9 +222,9 @@ __global__ void assign_labels(float* centroids, float* particles, float* newCent
 			particlesTile[row+28][col] = __float2half(nextParticlesTile[row + 28][col]);
 
             // Start asynchronous copy for the next tile
-			__pipeline_memcpy_async(&(nextParticlesTile[row][col]), &(particles[particlesOffset + 32 * 32 + threadIdx.x]), 4, 0);
-			__pipeline_memcpy_async(&(nextParticlesTile[row + 4][col]), &(particles[particlesOffset + 32 * 32 + 128 + threadIdx.x]), 4, 0);
-			__pipeline_memcpy_async(&(nextParticlesTile[row + 8][col]), &(particles[particlesOffset + 32 * 32 + 256 + threadIdx.x]), 4, 0);
+			__pipeline_memcpy_async(&(nextParticlesTile[row][col]),      &(particles[particlesOffset + 32 * 32 + threadIdx.x]), 4, 0);
+			__pipeline_memcpy_async(&(nextParticlesTile[row + 4][col]),  &(particles[particlesOffset + 32 * 32 + 128 + threadIdx.x]), 4, 0);
+			__pipeline_memcpy_async(&(nextParticlesTile[row + 8][col]),  &(particles[particlesOffset + 32 * 32 + 256 + threadIdx.x]), 4, 0);
 			__pipeline_memcpy_async(&(nextParticlesTile[row + 12][col]), &(particles[particlesOffset + 32 * 32 + 384 + threadIdx.x]), 4, 0);
 			__pipeline_memcpy_async(&(nextParticlesTile[row + 16][col]), &(particles[particlesOffset + 32 * 32 + 512 + threadIdx.x]), 4, 0);
 			__pipeline_memcpy_async(&(nextParticlesTile[row + 20][col]), &(particles[particlesOffset + 32 * 32 + 640 + threadIdx.x]), 4, 0);
@@ -238,10 +240,9 @@ __global__ void assign_labels(float* centroids, float* particles, float* newCent
 		startSumSquared = clock64();
 #endif
 
-
 		half mySquaredVal = __float2half(0.0f);
 		half newValue, outValue;
-		
+
 		if (warpIndex == 0){
 			for (long int step = 0; step < K; step++){
 				newValue = particlesTile[threadIdx.x][step];
@@ -288,14 +289,12 @@ __global__ void assign_labels(float* centroids, float* particles, float* newCent
 		__syncthreads();
 		*/
 
-
 #ifdef TIMING
 		stopSumSquared2 = clock64();
 		totalSumSquared2 += stopSumSquared2 - startSumSquared2;
 		startMMA = clock64();
 #endif
 #ifdef DEBUG
-
 		if (threadIdx.x == targetThreadIdx && blockIdx.x == targetBlockIdx && tileIndex == targetTileIndex){
 			printf("\nCentroids Tile 32x32: (on wmma entry)\n");
 			for (int i = 0; i < 32; i++){
@@ -319,7 +318,6 @@ __global__ void assign_labels(float* centroids, float* particles, float* newCent
 				printf("\n");
 			}
 		}
-
 #endif
 
 		wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
@@ -334,7 +332,7 @@ __global__ void assign_labels(float* centroids, float* particles, float* newCent
 			wmma::load_matrix_sync(b_frag, &(centroidsTile[0][0]), 32);
 			wmma::load_matrix_sync(c_frag, &(outputTile[0][0]), 32, wmma::mem_row_major);
 			mma_sync(c_frag, a_frag, b_frag, c_frag);
-			
+
 			// top right corner of A, bottom left corner of B, top left corner of C, top left corner of output
 			wmma::load_matrix_sync(a_frag, &(particlesTile[0][16]), 32);
 			wmma::load_matrix_sync(b_frag, &(centroidsTile[16][0]), 32);
@@ -411,7 +409,7 @@ __global__ void assign_labels(float* centroids, float* particles, float* newCent
 			long int minIndex = 0;
 			half minDistance = __habs(mmaOutputTile[threadIdx.x][0]);
 			half tempDistance;
-			
+
 			for (long int step = 1; step < 32; step++){
 				tempDistance = __habs(mmaOutputTile[threadIdx.x][step]);
 				if (tempDistance < minDistance){

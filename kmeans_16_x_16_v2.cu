@@ -25,19 +25,17 @@ const long int WMMA_K = 16;
 #define NTHREADS 32
 
 //#define DEBUG 1
-#define TIMING 1
+//#define TIMING 1
 #define DOUBLE_BUFFER 1
 
 __global__ void assign_labels(float* centroids, float* particles, int32_t* output, int32_t dim, int32_t nParticles, int32_t nCentroids) {
 #ifdef TIMING
 	unsigned long int startKernel, stopKernel, totalKernel;
 	unsigned long int startLoad, stopLoad, totalLoad;
-	unsigned long int startSumSquared, stopSumSquared, totalSumSquared;
 	unsigned long int startMMA, stopMMA, totalMMA;
 	unsigned long int startStore, stopStore, totalStore;
 	totalKernel = 0;
 	totalLoad = 0;
-	totalSumSquared = 0;
 	totalMMA = 0;
 	totalStore = 0;
 	startKernel = clock64();
@@ -48,7 +46,6 @@ __global__ void assign_labels(float* centroids, float* particles, int32_t* outpu
     __shared__ half           outputTile[K*N];
 
     __shared__ half        centroidsSquaredTileHalf[K*N];
-	__shared__ half				 sumSquaredTileHalf[K*N];
 
 	__shared__ float4 		nextParticlesTile[64];
 
@@ -69,7 +66,7 @@ __global__ void assign_labels(float* centroids, float* particles, int32_t* outpu
         }
 
         for (long int step = 0; step < 16; step++){
-			centroidsSquaredTileHalf[threadIdx.x * 16 + step]=mySquaredVal;
+			centroidsSquaredTileHalf[threadIdx.x * 16 + step]=__float2half(-0.5) *mySquaredVal;
 		}
     }
 
@@ -139,27 +136,6 @@ __global__ void assign_labels(float* centroids, float* particles, int32_t* outpu
 #ifdef TIMING
 		stopLoad = clock64();
 		totalLoad += stopLoad - startLoad;
-		startSumSquared = clock64();
-#endif
-
-        if (threadIdx.x < 16){
-            half mySquaredVal = __float2half(0.0f);
-            half newValue;
-
-            for (long int step = 0; step < 16; step++){
-                newValue = particlesTile[threadIdx.x * 16 + step];
-                mySquaredVal += newValue * newValue;
-            }
-
-            for (long int step = 0; step < 16; step++){
-				sumSquaredTileHalf[step * 16 + threadIdx.x] = __float2half(-0.5) * (mySquaredVal + centroidsSquaredTileHalf[step * 16 + threadIdx.x]);
-			}
-
-        }
-
-#ifdef TIMING
-		stopSumSquared = clock64();
-		totalSumSquared += stopSumSquared - startSumSquared;
 		startMMA = clock64();
 #endif
 
@@ -168,7 +144,7 @@ __global__ void assign_labels(float* centroids, float* particles, int32_t* outpu
         wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> c_frag;
         wmma::load_matrix_sync(a_frag, particlesTile, 16);
         wmma::load_matrix_sync(b_frag, centroidsTile, 16);
-        wmma::load_matrix_sync(c_frag, sumSquaredTileHalf, 16, wmma::mem_col_major);
+        wmma::load_matrix_sync(c_frag, centroidsSquaredTileHalf, 16, wmma::mem_row_major);
         mma_sync(c_frag, a_frag, b_frag, c_frag);
         wmma::store_matrix_sync(outputTile, c_frag, 16, wmma::mem_row_major);
 
@@ -205,7 +181,6 @@ __global__ void assign_labels(float* centroids, float* particles, int32_t* outpu
 	totalKernel = stopKernel - startKernel;
 	if (threadIdx.x == 0 && blockIdx.x == 0){
 		printf("Load: %lu\n", totalLoad);
-		printf("SumSquared: %lu\n", totalSumSquared);
 		printf("MMA: %lu\n", totalMMA);
 		printf("Store: %lu\n", totalStore);
 		printf("Total: %lu\n", totalKernel);
